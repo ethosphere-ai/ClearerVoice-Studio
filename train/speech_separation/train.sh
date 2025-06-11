@@ -1,7 +1,7 @@
 #!/bin/sh
 
-gpu_id=0,1,2,3 #4,6				# visible GPUs
-n_gpu=4 #2		# number of GPU used for training
+gpu_id=0,1				# visible GPUs
+n_gpu=2		# number of GPU used for training
 network=MossFormer2_SS_16K
 checkpoint_dir=checkpoints/$network						# leave empty if it's a new training, otherwise provide the 'log_name'
 config_pth=config/train/${network}.yaml		# the config file, only used if it's a new training
@@ -18,7 +18,16 @@ fi
 cp $config_pth $checkpoint_dir/config.yaml
 
 export PYTHONWARNINGS="ignore"
-CUDA_VISIBLE_DEVICES="$gpu_id" \
+export CUDA_LAUNCH_BLOCKING=1
+export CUDA_VISIBLE_DEVICES="$gpu_id"
+export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCH_SHOW_CPP_STACKTRACES=1
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=1
+export NCCL_P2P_DISABLE=1
+export NCCL_SOCKET_IFNAME=eth0
+export NCCL_BLOCKING_WAIT=1
+
 python -W ignore \
 -m torch.distributed.launch \
 --nproc_per_node=$n_gpu \
@@ -29,5 +38,4 @@ train.py \
 --train_from_last_checkpoint ${train_from_last_checkpoint} \
 --init_checkpoint_path ${init_checkpoint_path} \
 --print_freq ${print_freq} \
---checkpoint_save_freq ${checkpoint_save_freq} \
---use-cuda 0
+--checkpoint_save_freq ${checkpoint_save_freq}

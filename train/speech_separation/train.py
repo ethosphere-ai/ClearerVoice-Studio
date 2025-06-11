@@ -1,5 +1,6 @@
 import yamlargparse, os, random
 import numpy as np
+import datetime
 
 import torch
 from dataloader.dataloader import get_dataloader
@@ -12,6 +13,15 @@ def main(args):
     random.seed(args.seed)
     np.random.seed(args.seed)
     os.environ['PYTORCH_SEED'] = str(args.seed)
+    
+    # Set NCCL environment variables
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = "1"
+    os.environ["NCCL_BLOCKING_WAIT"] = "1"
+    os.environ["NCCL_DEBUG"] = "INFO"
+    os.environ["NCCL_IB_DISABLE"] = "1"
+    os.environ["NCCL_P2P_DISABLE"] = "1"
+    os.environ["NCCL_SOCKET_IFNAME"] = "eth0"
+    
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     torch.manual_seed(args.seed)
@@ -19,11 +29,26 @@ def main(args):
     args.device = device
 
     if args.distributed:
-        torch.cuda.set_device(args.local_rank)
-        torch.distributed.init_process_group(backend='nccl', rank=args.local_rank, init_method='env://', world_size=args.world_size)
+        if args.use_cuda:
+            torch.cuda.set_device(args.local_rank)
+            torch.distributed.init_process_group(backend='gloo', 
+                                               rank=args.local_rank, 
+                                               init_method='env://', 
+                                               world_size=args.world_size,
+                                               timeout=datetime.timedelta(seconds=3600))
+        else:
+            torch.distributed.init_process_group(backend='gloo', 
+                                               rank=args.local_rank, 
+                                               init_method='env://', 
+                                               world_size=args.world_size)
 
     from networks import network_wrapper
     model = network_wrapper(args).ss_network
+    
+    # Convert BatchNorm to SyncBatchNorm before moving to device
+    if args.distributed:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    
     model = model.to(device)
 
     if (args.distributed and args.local_rank ==0) or args.distributed == False:
@@ -120,7 +145,3 @@ if __name__ == '__main__':
         args.world_size = int(os.environ['WORLD_SIZE'])
     assert torch.backends.cudnn.enabled, "cudnn needs to be enabled"
     main(args)
-
-
-
-

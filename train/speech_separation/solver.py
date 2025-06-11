@@ -20,13 +20,25 @@ class Solver(object):
             self.writer = SummaryWriter('%s/tensorboard/' % args.checkpoint_dir)
 
         self.model = model
-        self.optimizer=optimizer
+        self.optimizer = optimizer
+        
+        # Wrap model with DDP after moving to device
         if self.args.distributed:
             self.model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
-            self.model = DDP(self.model, device_ids=[self.args.local_rank],find_unused_parameters=True)
+            if args.use_cuda:
+                self.model = DDP(self.model, 
+                               device_ids=[self.args.local_rank],
+                               output_device=self.args.local_rank,
+                               find_unused_parameters=True,
+                               broadcast_buffers=False)
+            else:
+                self.model = DDP(self.model, 
+                               find_unused_parameters=True,
+                               broadcast_buffers=False)
+        
         self._init()
  
-        if self.args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K'] :
+        if self.args.network in ['MossFormer2_SS_16K','MossFormer2_SS_8K']:
             self._run_one_epoch = self._run_one_epoch_mossformer2_ss
         else:
             print(f'_run_one_epoch is not implemented for {self.args.network}!')
