@@ -1,7 +1,7 @@
 #!/bin/sh
 
-gpu_id=0,1				# visible GPUs
-n_gpu=2		# number of GPU used for training
+gpu_id=0				# visible GPUs
+n_gpu=1		# number of GPU used for training
 network=MossFormer2_SS_16K
 checkpoint_dir=checkpoints/$network						# leave empty if it's a new training, otherwise provide the 'log_name'
 config_pth=config/train/${network}.yaml		# the config file, only used if it's a new training
@@ -29,9 +29,6 @@ export NCCL_SOCKET_IFNAME=eth0
 export NCCL_BLOCKING_WAIT=1
 
 python -W ignore \
--m torch.distributed.launch \
---nproc_per_node=$n_gpu \
---master_port=$(date '+88%S') \
 train.py \
 --config ${config_pth} \
 --checkpoint_dir ${checkpoint_dir} \
@@ -39,3 +36,7 @@ train.py \
 --init_checkpoint_path ${init_checkpoint_path} \
 --print_freq ${print_freq} \
 --checkpoint_save_freq ${checkpoint_save_freq}
+
+# -m torch.distributed.launch \
+# --nproc_per_node=$n_gpu \
+# --master_port=$(date '+88%S') \

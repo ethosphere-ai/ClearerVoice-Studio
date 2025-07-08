@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import copy
 from models.mossformer2.mossformer2_block import ScaledSinuEmbedding, MossformerBlock_GFSMN, MossformerBlock
-
+from models.model_utils.conditioning_layers import FiLM
 
 EPS = 1e-8
 
@@ -553,6 +553,7 @@ class MossFormer_MaskNet(nn.Module):
         skip_around_intra=True,
         use_global_pos_enc=True,
         max_length=20000,
+        emb_dim=256
     ):
         super(MossFormer_MaskNet, self).__init__()
         self.num_spks = num_spks
@@ -563,6 +564,7 @@ class MossFormer_MaskNet(nn.Module):
 
         if self.use_global_pos_enc:
             self.pos_enc = ScaledSinuEmbedding(out_channels)
+
 
         self.mdl = Computation_Block(
                     num_blocks,
@@ -585,7 +587,7 @@ class MossFormer_MaskNet(nn.Module):
             nn.Conv1d(out_channels, out_channels, 1), nn.Sigmoid()
         )
 
-    def forward(self, x):
+    def forward(self, x, spk_emb=None):
         """Returns the output tensor.
 
         Arguments
@@ -734,6 +736,240 @@ class MossFormer(nn.Module):
         for spk in range(self.num_spks):
             out.append(est_source[:,:,spk])
         return out
+
+class MossFormer_MaskNet_TargetSpeaker(nn.Module):
+    """The MossFormer MaskNet for predicting mask for encoder output features.
+       The MossFormer2 model uses an upgraded MaskNet structure
+
+    Arguments
+    ---------
+    in_channels : int
+        Number of channels at the output of the encoder.
+    out_channels : int
+        Number of channels that would be inputted to the intra and inter blocks.
+    intra_model : torch.nn.module
+        Model to process within the chunks.
+    num_layers : int
+        Number of layers of Dual Computation Block.
+    norm : str
+        Normalization type.
+    num_spks : int
+        Number of sources (speakers).
+    skip_around_intra : bool
+        Skip connection around intra.
+    use_global_pos_enc : bool
+        Global positional encodings.
+    max_length : int
+        Maximum sequence length.
+
+    Example
+    ---------
+    >>> mossformer_masknet = MossFormer_MaskNet(64, 64, num_spks=2)
+    >>> x = torch.randn(10, 64, 2000)
+    >>> x = mossformer_masknet(x)
+    >>> x.shape
+    torch.Size([2, 10, 64, 2000])
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        num_blocks=24,
+        norm="ln",
+        skip_around_intra=True,
+        use_global_pos_enc=True,
+        max_length=20000,
+        use_FILM=False,
+        emb_dim=256
+    ):
+        super(MossFormer_MaskNet, self).__init__()
+        self.num_spks = num_spks
+        self.num_blocks = num_blocks
+        self.norm = select_norm(norm, in_channels, 3)
+        self.conv1d_encoder = nn.Conv1d(in_channels, out_channels, 1, bias=False)
+        self.use_global_pos_enc = use_global_pos_enc
+
+        if self.use_global_pos_enc:
+            self.pos_enc = ScaledSinuEmbedding(out_channels)
+
+        if use_FILM:
+            self.use_FILM = True
+            self.film = FiLM(emb_dim, out_channels)
+
+        self.mdl = Computation_Block(
+                    num_blocks,
+                    out_channels,
+                    norm,
+                    skip_around_intra=skip_around_intra,
+                )
+
+        self.conv1d_out = nn.Conv1d(
+            out_channels, out_channels, kernel_size=1
+        )
+        self.conv1_decoder = nn.Conv1d(out_channels, in_channels, 1, bias=False)
+        self.prelu = nn.PReLU()
+        self.activation = nn.ReLU()
+        # gated output layer
+        self.output = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, 1), nn.Tanh()
+        )
+        self.output_gate = nn.Sequential(
+            nn.Conv1d(out_channels, out_channels, 1), nn.Sigmoid()
+        )
+
+    def forward(self, x, spk_emb=None):
+        """Returns the output tensor.
+
+        Arguments
+        ---------
+        x : torch.Tensor
+            Input tensor of dimension [B, N, S].
+
+        Returns
+        -------
+        out : torch.Tensor
+            Output tensor of dimension [spks, B, N, S]
+            where, spks = Number of speakers
+               B = Batchsize,
+               N = number of filters
+               S = the number of time frames
+        """
+
+        # before each line we indicate the shape after executing the line
+
+        # [B, N, L]
+        x = self.norm(x)
+
+        # [B, N, L]
+        x = self.conv1d_encoder(x)
+        if self.use_global_pos_enc:
+            base = x
+            x = x.transpose(1, -1)
+            emb = self.pos_enc(x)
+            emb = emb.transpose(0, -1) 
+            x = base + emb
+            
+        if self.use_FILM:
+            x = self.film(x, spk_emb)
+
+        # [B, N, S]
+        x = self.mdl(x)
+        x = self.prelu(x)
+
+        # [B, N, S]
+        x = self.conv1d_out(x)
+        B, _, S = x.shape
+
+        # [B, N, S]
+        x = x.view(B, -1, S)
+
+        # [B, N, S]
+        x = self.output(x) * self.output_gate(x)
+
+        # [B, N, S]
+        x = self.conv1_decoder(x)
+
+        # [B, 1, N, S]
+        _, N, L = x.shape
+        x = x.view(B, 1, N, L)
+        x = self.activation(x)
+
+        # [1, B, N, S]
+        x = x.transpose(0, 1)
+
+        return x
+
+class MossFormer_TargetSpeaker(nn.Module):
+    """ The E2E Encoder-MaskNet-Decoder MossFormer model for target speaker extraction
+        The MossFormer2 model uses an upgraded MaskNet
+    ---------
+    Arguments
+    ---------
+    in_channels : int
+        Number of channels at the output of the encoder.
+    out_channels : int
+        Number of channels that would be inputted to the MossFormer2 blocks.
+    num_layers : int
+        Number of layers of Dual Computation Block.
+    norm : str
+        Normalization type.
+    num_spks : int
+        Number of sources (speakers).
+    skip_around_intra : bool
+        Skip connection around intra.
+    use_global_pos_enc : bool
+        Global positional encodings.
+    max_length : int
+        Maximum sequence length.
+
+    Example
+    ---------
+    >>> mossformer = MossFormer(num_spks=2)
+    >>> x = torch.randn(1, 10000)
+    >>> x = mossformer(x)
+    >>> x
+    x[0]: torch.Size([1, 10000])
+    x[1]: torch.Size([1, 10000])
+    """
+    def __init__(
+        self,
+        in_channels=512,
+        out_channels=512,
+        num_blocks=24,
+        kernel_size=16,
+        norm="ln",
+        num_spks=2,
+        skip_around_intra=True,
+        use_global_pos_enc=True,
+        max_length=20000,
+    ):
+        super(MossFormer, self).__init__()
+        self.num_spks = num_spks
+        self.enc = Encoder(kernel_size=kernel_size, out_channels=in_channels, in_channels=1)
+        self.mask_net = MossFormer_MaskNet(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            num_blocks=num_blocks,
+            norm=norm,
+            num_spks=num_spks,
+            skip_around_intra=skip_around_intra,
+            use_global_pos_enc=use_global_pos_enc,
+            max_length=max_length,
+        )
+        self.dec = Decoder(
+           in_channels=out_channels,
+           out_channels=1,
+           kernel_size=kernel_size,
+           stride = kernel_size//2,
+           bias=False
+        )
+    def forward(self, input):
+        x = self.enc(input)
+        mask = self.mask_net(x)
+        x = torch.stack([x] * self.num_spks)
+        sep_x = x * mask
+
+        # Decoding
+        est_source = torch.cat(
+            [
+                self.dec(sep_x[i]).unsqueeze(-1)
+                for i in range(self.num_spks)
+            ],
+            dim=-1,
+        )
+        T_origin = input.size(1)
+        T_est = est_source.size(1)
+        if T_origin > T_est:
+            est_source = F.pad(est_source, (0, 0, 0, T_origin - T_est))
+        else:
+            est_source = est_source[:, :T_origin, :]
+
+        out = []
+        for spk in range(self.num_spks):
+            out.append(est_source[:,:,spk])
+        return out
+
 
 
 class MossFormer2_SS(nn.Module):
